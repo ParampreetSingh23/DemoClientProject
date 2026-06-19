@@ -1,0 +1,21 @@
+.DS_Store
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Generated reports and QA artifacts
+outputs/
+
+# Local spreadsheet inputs/exports
+*.xlsx
+*.xls
+*.csv
+*.ndjson
+
+# Logs and local env
+*.log
+.env
+.env.*
