@@ -13,14 +13,13 @@ import {
   Loader2,
   Play,
   RefreshCw,
-  Settings2,
   UploadCloud,
 } from "lucide-react";
 import "./styles.css";
 
 const CATEGORIES = ["CME", "CMS", "LMA", "YLC", "Others"];
 const INVOICE_CATEGORY_ORDER = ["CMS", "CME", "LMA", "YLC", "Others"];
-const DISPLAY_TABS = ["All", "Matched", "Amount mismatch", "Aggregator only", "API only"];
+const DISPLAY_TABS = ["All", "Matched", "Amount mismatch", "Aggregator only", "API only", "Daily Summary"];
 
 function normalize(value) {
   if (value === undefined || value === null) return "";
@@ -300,6 +299,71 @@ function queueLookup(piRows) {
   return lookup;
 }
 
+function buildDailySummary(allResults) {
+  const dailyMap = new Map();
+
+  allResults.forEach((row) => {
+    let dateStr = "Unknown Date";
+    const rawDate = row.aggregatorDate || row.piDate;
+    if (rawDate) {
+      const parsed = parseDateString(rawDate);
+      if (parsed) {
+        const y = parsed.getFullYear();
+        const m = String(parsed.getMonth() + 1).padStart(2, "0");
+        const d = String(parsed.getDate()).padStart(2, "0");
+        dateStr = `${y}-${m}-${d}`;
+      }
+    }
+
+    if (!dailyMap.has(dateStr)) {
+      dailyMap.set(dateStr, {
+        date: dateStr,
+        aggregatorRecords: 0,
+        piRecords: 0,
+        matchedRecords: 0,
+        amountMismatches: 0,
+        aggregatorOnly: 0,
+        piOnly: 0,
+        aggregatorGrossTotal: 0,
+        piTotal: 0,
+        matchedAggGross: 0,
+        matchedPiTotal: 0,
+      });
+    }
+
+    const data = dailyMap.get(dateStr);
+
+    if (row.status === "Matched" || row.status === "Amount mismatch") {
+      data.aggregatorRecords += 1;
+      data.piRecords += 1;
+      data.aggregatorGrossTotal = Number((data.aggregatorGrossTotal + toNumber(row.aggregatorAmount)).toFixed(2));
+      data.piTotal = Number((data.piTotal + toNumber(row.piAmount)).toFixed(2));
+      
+      if (row.status === "Matched") {
+        data.matchedRecords += 1;
+        data.matchedAggGross = Number((data.matchedAggGross + toNumber(row.aggregatorAmount)).toFixed(2));
+        data.matchedPiTotal = Number((data.matchedPiTotal + toNumber(row.piAmount)).toFixed(2));
+      } else {
+        data.amountMismatches += 1;
+      }
+    } else if (row.status === "Aggregator only") {
+      data.aggregatorRecords += 1;
+      data.aggregatorOnly += 1;
+      data.aggregatorGrossTotal = Number((data.aggregatorGrossTotal + toNumber(row.aggregatorAmount)).toFixed(2));
+    } else if (row.status === "API only") {
+      data.piRecords += 1;
+      data.piOnly += 1;
+      data.piTotal = Number((data.piTotal + toNumber(row.piAmount)).toFixed(2));
+    }
+  });
+
+  return Array.from(dailyMap.values()).sort((a, b) => {
+    if (a.date === "Unknown Date") return 1;
+    if (b.date === "Unknown Date") return -1;
+    return a.date.localeCompare(b.date);
+  });
+}
+
 function reconcileRows(aggregatorRows, piRows, startDateStr, endDateStr) {
   let filteredAgg = aggregatorRows;
   let filteredPi = piRows;
@@ -457,6 +521,8 @@ function reconcileRows(aggregatorRows, piRows, startDateStr, endDateStr) {
     };
   });
 
+  const dailySummary = buildDailySummary(all);
+
   return {
     all,
     matched,
@@ -464,6 +530,7 @@ function reconcileRows(aggregatorRows, piRows, startDateStr, endDateStr) {
     aggregatorOnly,
     piOnly,
     summary,
+    dailySummary,
   };
 }
 
@@ -482,10 +549,71 @@ function integer(value) {
   return new Intl.NumberFormat("en-IN").format(value || 0);
 }
 
+function formatExportSheet(sheet, rows, isInvoice = false) {
+  if (!rows || !rows.length) return;
+
+  const colWidths = [];
+  
+  if (Array.isArray(rows[0])) {
+    rows.forEach((row) => {
+      row.forEach((val, colIndex) => {
+        let strVal = "";
+        if (val instanceof Date) {
+          strVal = XLSX.SSF.format("yyyy-mm-dd hh:mm:ss", val);
+        } else if (val !== null && val !== undefined) {
+          strVal = String(val);
+        }
+        const len = strVal.length;
+        colWidths[colIndex] = Math.max(colWidths[colIndex] || 10, len + 3);
+      });
+    });
+  } else {
+    rows.forEach((row) => {
+      Object.keys(row).forEach((key, colIndex) => {
+        const val = row[key];
+        let strVal = "";
+        if (val instanceof Date) {
+          strVal = XLSX.SSF.format("yyyy-mm-dd hh:mm:ss", val);
+        } else if (val !== null && val !== undefined) {
+          strVal = String(val);
+        }
+        const len = strVal.length;
+        const keyLen = String(key).length;
+        colWidths[colIndex] = Math.max(colWidths[colIndex] || 10, len + 3, keyLen + 3);
+      });
+    });
+  }
+
+  sheet["!cols"] = colWidths.map((w) => ({ wch: Math.min(w, 45) }));
+
+  const rowHeights = [];
+  rows.forEach((row, rowIndex) => {
+    if (isInvoice) {
+      const isHeader = Array.isArray(row) && (row.includes("Cost Category") || row.includes("Category") && row.includes("Ledger Account - Dr"));
+      const isEmpty = Array.isArray(row) && row.length === 0;
+      if (isHeader) {
+        rowHeights.push({ hpt: 24 });
+      } else if (isEmpty) {
+        rowHeights.push({ hpt: 15 });
+      } else {
+        rowHeights.push({ hpt: 18 });
+      }
+    } else {
+      if (rowIndex === 0) {
+        rowHeights.push({ hpt: 24 });
+      } else {
+        rowHeights.push({ hpt: 18 });
+      }
+    }
+  });
+  sheet["!rows"] = rowHeights;
+}
+
 function exportTallyOnlyReport(result) {
   const workbook = XLSX.utils.book_new();
   const invoiceRows = buildInvoiceSheetRows(result.matched.filter((row) => row.status === "Matched"));
   const sheet = Array.isArray(invoiceRows[0]) ? XLSX.utils.aoa_to_sheet(invoiceRows) : XLSX.utils.json_to_sheet(invoiceRows);
+  formatExportSheet(sheet, invoiceRows, true);
   XLSX.utils.book_append_sheet(workbook, sheet, "Invoice");
   XLSX.writeFile(workbook, `tally_ready_invoice_${new Date().toISOString().slice(0, 10)}.xlsx`);
 }
@@ -509,6 +637,19 @@ function exportReport(result, metadata) {
     "Unmatched API Total": row.unmatchedPiTotal,
   }));
 
+  const dailySummaryRows = result.dailySummary.map((row) => ({
+    Date: row.date,
+    "Aggregator Records": row.aggregatorRecords,
+    "API Records": row.piRecords,
+    "Matched Records": row.matchedRecords,
+    "Amount Mismatches": row.amountMismatches,
+    "Aggregator Only": row.aggregatorOnly,
+    "API Only": row.piOnly,
+    "Aggregator Gross Total": row.aggregatorGrossTotal,
+    "API Total Amt": row.piTotal,
+    "Matched Agg Amt": row.matchedAggGross,
+  }));
+
   const rules = [
     ["Generated", new Date().toLocaleString()],
     ["Aggregator files", metadata.aggregatorFiles.map((file) => file.name).join(", ")],
@@ -523,6 +664,7 @@ function exportReport(result, metadata) {
   const sheets = [
     ["Invoice", invoiceRows],
     ["Summary", summaryRows],
+    ["Daily Summary", dailySummaryRows],
     ["Matching Rules", rules],
     ["Matched", auditRows(result.matched)],
     ["Amount Mismatch", auditRows(result.amountMismatches)],
@@ -533,6 +675,7 @@ function exportReport(result, metadata) {
 
   sheets.forEach(([name, rows]) => {
     const sheet = Array.isArray(rows[0]) ? XLSX.utils.aoa_to_sheet(rows) : XLSX.utils.json_to_sheet(rows);
+    formatExportSheet(sheet, rows, name === "Invoice");
     XLSX.utils.book_append_sheet(workbook, sheet, name);
   });
 
@@ -626,6 +769,7 @@ function App() {
       "Amount mismatch": result.amountMismatches,
       "Aggregator only": result.aggregatorOnly,
       "API only": result.piOnly,
+      "Daily Summary": result.dailySummary,
     };
     return rowsByTab[activeTab] || [];
   }, [activeTab, result]);
@@ -770,20 +914,6 @@ function App() {
                 <h2>Category Mapping</h2>
                 <p>Review how API sheets are classified before reconciliation.</p>
               </div>
-              <button
-                className="ghost-button"
-                onClick={() => {
-                  const nextOverrides = {};
-                  piFiles.forEach((file) => {
-                    nextOverrides[file.id] = inferCategory(file.name);
-                  });
-                  setCategoryOverrides(nextOverrides);
-                  setResult(null);
-                }}
-              >
-                <Settings2 size={16} />
-                Default Rules
-              </button>
             </div>
 
             <div className="category-tabs">
@@ -899,7 +1029,7 @@ function App() {
               Export Tally-Ready Only
             </button>
           </div>
-          <ResultsTable rows={visibleRows} onRowClick={setSelectedRow} />
+          <ResultsTable rows={visibleRows} onRowClick={setSelectedRow} activeTab={activeTab} />
         </section>
       </main>
       {selectedRow && (
@@ -988,6 +1118,84 @@ function SourcePreview({ aggregators, pi }) {
   );
 }
 
+function SummaryChart({ totals, onCardClick }) {
+  const [hoveredSegment, setHoveredSegment] = useState(null);
+
+  const sum = totals.matched + totals.mismatch + totals.aggregatorOnly + totals.piOnly;
+  const radius = 40;
+  const circumference = 2 * Math.PI * radius;
+
+  const rawSegments = [
+    { id: "Matched", value: totals.matched, color: "var(--green)", tone: "good" },
+    { id: "Amount mismatch", value: totals.mismatch, color: "var(--orange)", tone: "warn" },
+    { id: "Aggregator only", value: totals.aggregatorOnly, color: "var(--blue)", tone: "info" },
+    { id: "API only", value: totals.piOnly, color: "var(--violet)", tone: "violet" }
+  ];
+
+  let cumulativeValue = 0;
+  const segments = rawSegments
+    .filter(seg => seg.value > 0)
+    .map(seg => {
+      const percentage = seg.value / sum;
+      const strokeLength = percentage * circumference;
+      const offset = (cumulativeValue / sum) * circumference;
+      cumulativeValue += seg.value;
+      return {
+        ...seg,
+        strokeLength,
+        strokeOffset: -offset,
+      };
+    });
+
+  const displayVal = hoveredSegment ? hoveredSegment.value : sum;
+  const displayLabel = hoveredSegment ? hoveredSegment.id : "Total Records";
+  const displayTone = hoveredSegment ? hoveredSegment.tone : "total";
+
+  return (
+    <div className="chart-wrapper">
+      <svg className="donut-svg" viewBox="0 0 100 100">
+        {sum === 0 ? (
+          <circle
+            cx="50"
+            cy="50"
+            r={radius}
+            fill="transparent"
+            stroke="var(--soft-line)"
+            strokeWidth={8}
+          />
+        ) : (
+          segments.map((seg) => (
+            <circle
+              key={seg.id}
+              cx="50"
+              cy="50"
+              r={radius}
+              fill="transparent"
+              stroke={seg.color}
+              strokeWidth={hoveredSegment?.id === seg.id ? 12 : 8}
+              strokeDasharray={`${seg.strokeLength} ${circumference}`}
+              strokeDashoffset={seg.strokeOffset}
+              className={`donut-segment ${seg.tone}`}
+              onMouseEnter={() => setHoveredSegment(seg)}
+              onMouseLeave={() => setHoveredSegment(null)}
+              onClick={() => onCardClick(seg.id)}
+              style={{
+                transition: "stroke-width 0.25s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease",
+                opacity: hoveredSegment && hoveredSegment.id !== seg.id ? 0.5 : 1,
+                cursor: "pointer",
+              }}
+            />
+          ))
+        )}
+      </svg>
+      <div className={`chart-center-text ${displayTone}`}>
+        <span className="chart-value">{new Intl.NumberFormat("en-IN").format(displayVal)}</span>
+        <span className="chart-label">{displayLabel}</span>
+      </div>
+    </div>
+  );
+}
+
 function SummaryPanel({ result, totals, onCardClick, activeTab }) {
   const cards = [
     ["Matched", totals.matched, "Transactions reconciled", "good", Check],
@@ -1003,6 +1211,8 @@ function SummaryPanel({ result, totals, onCardClick, activeTab }) {
           <p>{result ? "Latest run is ready for review." : "Run reconciliation after uploading files."}</p>
         </div>
       </div>
+      <SummaryChart totals={totals} onCardClick={onCardClick} />
+
       {cards.map(([title, value, label, tone, Icon]) => {
         const isActive = activeTab === title;
         return (
@@ -1035,7 +1245,54 @@ function SummaryPanel({ result, totals, onCardClick, activeTab }) {
   );
 }
 
-function ResultsTable({ rows, onRowClick }) {
+function ResultsTable({ rows, onRowClick, activeTab }) {
+  if (activeTab === "Daily Summary") {
+    return (
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Aggregator Records</th>
+              <th>API Records</th>
+              <th>Matched Records</th>
+              <th>Amount Mismatches</th>
+              <th>Aggregator Only</th>
+              <th>API Only</th>
+              <th>Aggregator Gross Total</th>
+              <th>API Total Amt</th>
+              <th>Matched Agg Amt</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length ? (
+              rows.map((row, index) => (
+                <tr key={`${row.date}-${index}`}>
+                  <td><strong>{row.date}</strong></td>
+                  <td>{integer(row.aggregatorRecords)}</td>
+                  <td>{integer(row.piRecords)}</td>
+                  <td>{integer(row.matchedRecords)}</td>
+                  <td>{integer(row.amountMismatches)}</td>
+                  <td>{integer(row.aggregatorOnly)}</td>
+                  <td>{integer(row.piOnly)}</td>
+                  <td>₹ {money(row.aggregatorGrossTotal)}</td>
+                  <td>₹ {money(row.piTotal)}</td>
+                  <td>₹ {money(row.matchedAggGross)}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan="10" className="empty-state">
+                  No summary records available.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
   const preview = rows.slice(0, 150);
   return (
     <div className="table-wrap">
