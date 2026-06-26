@@ -30,6 +30,22 @@ function normalize(value) {
   return text;
 }
 
+function parseDateString(dateStr) {
+  if (!dateStr) return null;
+  let match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}):(\d{2}))?/);
+  if (match) {
+    const [_, y, m, d, hh = 0, mm = 0, ss = 0] = match.map(Number);
+    return new Date(y, m - 1, d, hh, mm, ss);
+  }
+  match = dateStr.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?/);
+  if (match) {
+    const [_, d, m, y, hh = 0, mm = 0, ss = 0] = match.map(Number);
+    return new Date(y, m - 1, d, hh, mm, ss);
+  }
+  const parsed = new Date(dateStr);
+  return isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function toNumber(value) {
   if (value === undefined || value === null || value === "") return 0;
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -284,20 +300,49 @@ function queueLookup(piRows) {
   return lookup;
 }
 
-function reconcileRows(aggregatorRows, piRows) {
-  const lookup = queueLookup(piRows);
+function reconcileRows(aggregatorRows, piRows, startDateStr, endDateStr) {
+  let filteredAgg = aggregatorRows;
+  let filteredPi = piRows;
+
+  if (startDateStr || endDateStr) {
+    let startLimit = null;
+    let endLimit = null;
+
+    if (startDateStr) {
+      const [y, m, d] = startDateStr.split('-').map(Number);
+      startLimit = new Date(y, m - 1, d, 0, 0, 0, 0);
+    }
+    if (endDateStr) {
+      const [y, m, d] = endDateStr.split('-').map(Number);
+      endLimit = new Date(y, m - 1, d, 23, 59, 59, 999);
+    }
+
+    const filterFn = (row) => {
+      if (!row.date) return false;
+      const d = parseDateString(row.date);
+      if (!d) return false;
+      if (startLimit && d < startLimit) return false;
+      if (endLimit && d > endLimit) return false;
+      return true;
+    };
+
+    filteredAgg = aggregatorRows.filter(filterFn);
+    filteredPi = piRows.filter(filterFn);
+  }
+
+  const lookup = queueLookup(filteredPi);
   const usedPi = new Set();
   const matched = [];
   const aggregatorOnly = [];
 
-  aggregatorRows.forEach((agg) => {
+  filteredAgg.forEach((agg) => {
     const candidates = [];
     agg.matchAttempts.forEach(([field, value, rule]) => {
       if (!value) return;
       const key = `${agg.category}::${field}::${value}`;
       (lookup.get(key) || []).forEach((piIndex) => {
         if (!usedPi.has(piIndex)) {
-          const pi = piRows[piIndex];
+          const pi = filteredPi[piIndex];
           candidates.push({
             piIndex,
             pi,
@@ -369,7 +414,7 @@ function reconcileRows(aggregatorRows, piRows) {
     });
   });
 
-  const piOnly = piRows
+  const piOnly = filteredPi
     .filter((_, index) => !usedPi.has(index))
     .map((pi) => ({
       status: "API only",
@@ -389,8 +434,8 @@ function reconcileRows(aggregatorRows, piRows) {
 
   const all = [...matched, ...aggregatorOnly, ...piOnly];
   const summary = CATEGORIES.slice(0, 4).map((category) => {
-    const aggForCategory = aggregatorRows.filter((row) => row.category === category);
-    const piForCategory = piRows.filter((row) => row.category === category);
+    const aggForCategory = filteredAgg.filter((row) => row.category === category);
+    const piForCategory = filteredPi.filter((row) => row.category === category);
     const matchedForCategory = matched.filter((row) => row.category === category);
     const mismatches = matchedForCategory.filter((row) => row.status === "Amount mismatch");
     const aggOnly = aggregatorOnly.filter((row) => row.category === category);
@@ -437,6 +482,14 @@ function integer(value) {
   return new Intl.NumberFormat("en-IN").format(value || 0);
 }
 
+function exportTallyOnlyReport(result) {
+  const workbook = XLSX.utils.book_new();
+  const invoiceRows = buildInvoiceSheetRows(result.matched.filter((row) => row.status === "Matched"));
+  const sheet = Array.isArray(invoiceRows[0]) ? XLSX.utils.aoa_to_sheet(invoiceRows) : XLSX.utils.json_to_sheet(invoiceRows);
+  XLSX.utils.book_append_sheet(workbook, sheet, "Invoice");
+  XLSX.writeFile(workbook, `tally_ready_invoice_${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
 function exportReport(result, metadata) {
   const workbook = XLSX.utils.book_new();
   const invoiceRows = buildInvoiceSheetRows(result.matched.filter((row) => row.status === "Matched"));
@@ -460,6 +513,7 @@ function exportReport(result, metadata) {
     ["Generated", new Date().toLocaleString()],
     ["Aggregator files", metadata.aggregatorFiles.map((file) => file.name).join(", ")],
     ["API files", metadata.piFiles.map((file) => file.name).join(", ")],
+    ["Date Filter Applied", metadata.startDate || metadata.endDate ? `${metadata.startDate || 'Beginning'} to ${metadata.endDate || 'End'}` : "None"],
     ["HDFC MAT", "CCAvenue Ref# = CMS API Reference_No; Order No = API Transaction_No"],
     ["HDFC Others", "Order No = CME API Reference_No; CCAvenue Ref# = API Transaction_No"],
     ["BillDesk", "Ref. 1 = API Reference_No; PGI Ref. No. = API Transaction_No"],
@@ -554,6 +608,9 @@ function App() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [selectedRow, setSelectedRow] = useState(null);
 
   const parsed = useMemo(() => {
     const aggregators = parseAggregatorFiles(aggregatorFiles);
@@ -617,7 +674,7 @@ function App() {
       setError("Upload at least one API invoice workbook.");
       return;
     }
-    setResult(reconcileRows(parsed.aggregators.rows, parsed.pi.rows));
+    setResult(reconcileRows(parsed.aggregators.rows, parsed.pi.rows, startDate, endDate));
     setActiveTab("All");
   }
 
@@ -625,6 +682,9 @@ function App() {
     setAggregatorFiles([]);
     setPiFiles([]);
     setCategoryOverrides({});
+    setStartDate("");
+    setEndDate("");
+    setSelectedRow(null);
     setResult(null);
     setError("");
   }
@@ -757,6 +817,48 @@ function App() {
 
             <SourcePreview aggregators={parsed.aggregators} pi={parsed.pi} />
 
+            <div className="date-filter-section">
+              <div className="section-header">
+                <h3>Date Range Filter</h3>
+                <small className="muted">Only reconcile records falling within this range (optional)</small>
+              </div>
+              <div className="date-inputs">
+                <div className="input-group">
+                  <label htmlFor="startDate">Start Date</label>
+                  <input
+                    type="date"
+                    id="startDate"
+                    value={startDate}
+                    onChange={(e) => {
+                      setStartDate(e.target.value);
+                      setResult(null);
+                    }}
+                  />
+                </div>
+                <div className="input-group">
+                  <label htmlFor="endDate">End Date</label>
+                  <input
+                    type="date"
+                    id="endDate"
+                    value={endDate}
+                    onChange={(e) => {
+                      setEndDate(e.target.value);
+                      setResult(null);
+                    }}
+                  />
+                </div>
+                {(startDate || endDate) && (
+                  <button className="clear-date-button" onClick={() => {
+                    setStartDate("");
+                    setEndDate("");
+                    setResult(null);
+                  }}>
+                    Clear Date Filter
+                  </button>
+                )}
+              </div>
+            </div>
+
             <div className="runbar">
               <button className="primary-button" onClick={runReconciliation}>
                 <Play size={17} />
@@ -768,7 +870,7 @@ function App() {
             </div>
           </div>
 
-          <SummaryPanel result={result} totals={totals} />
+          <SummaryPanel result={result} totals={totals} onCardClick={setActiveTab} activeTab={activeTab} />
         </section>
 
         <section className="panel result-panel">
@@ -783,15 +885,26 @@ function App() {
             <button
               className="export-button"
               disabled={!result}
-              onClick={() => exportReport(result, { aggregatorFiles, piFiles })}
+              onClick={() => exportReport(result, { aggregatorFiles, piFiles, startDate, endDate })}
             >
               <FileSpreadsheet size={17} />
               Export to Excel
             </button>
+            <button
+              className="export-button tally-only-button"
+              disabled={!result}
+              onClick={() => exportTallyOnlyReport(result)}
+            >
+              <ArrowDownToLine size={17} />
+              Export Tally-Ready Only
+            </button>
           </div>
-          <ResultsTable rows={visibleRows} />
+          <ResultsTable rows={visibleRows} onRowClick={setSelectedRow} />
         </section>
       </main>
+      {selectedRow && (
+        <DetailModal row={selectedRow} onClose={() => setSelectedRow(null)} />
+      )}
     </div>
   );
 }
@@ -875,7 +988,7 @@ function SourcePreview({ aggregators, pi }) {
   );
 }
 
-function SummaryPanel({ result, totals }) {
+function SummaryPanel({ result, totals, onCardClick, activeTab }) {
   const cards = [
     ["Matched", totals.matched, "Transactions reconciled", "good", Check],
     ["Amount mismatch", totals.mismatch, "Reference matched, amount differs", "warn", CircleAlert],
@@ -890,16 +1003,30 @@ function SummaryPanel({ result, totals }) {
           <p>{result ? "Latest run is ready for review." : "Run reconciliation after uploading files."}</p>
         </div>
       </div>
-      {cards.map(([title, value, label, tone, Icon]) => (
-        <div className={`metric ${tone}`} key={title}>
-          <Icon size={22} />
-          <div>
-            <strong>{title}</strong>
-            <span>{label}</span>
+      {cards.map(([title, value, label, tone, Icon]) => {
+        const isActive = activeTab === title;
+        return (
+          <div 
+            className={`metric ${tone} clickable ${isActive ? "active-metric" : ""}`} 
+            key={title}
+            onClick={() => onCardClick(title)}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                onCardClick(title);
+              }
+            }}
+          >
+            <Icon size={22} />
+            <div>
+              <strong>{title}</strong>
+              <span>{label}</span>
+            </div>
+            <b>{integer(value)}</b>
           </div>
-          <b>{integer(value)}</b>
-        </div>
-      ))}
+        );
+      })}
       <div className="total-box">
         <span>Matched gross amount</span>
         <strong>₹ {money(totals.totalAmount)}</strong>
@@ -908,7 +1035,7 @@ function SummaryPanel({ result, totals }) {
   );
 }
 
-function ResultsTable({ rows }) {
+function ResultsTable({ rows, onRowClick }) {
   const preview = rows.slice(0, 150);
   return (
     <div className="table-wrap">
@@ -923,12 +1050,17 @@ function ResultsTable({ rows }) {
             <th>API Amount</th>
             <th>Difference</th>
             <th>Candidate / Remarks</th>
+            <th>Action</th>
           </tr>
         </thead>
         <tbody>
           {preview.length ? (
             preview.map((row, index) => (
-              <tr key={`${row.status}-${index}`}>
+              <tr 
+                key={`${row.status}-${index}`}
+                className="clickable-row"
+                onClick={() => onRowClick && onRowClick(row)}
+              >
                 <td>
                   <span className={`status ${statusClass(row.status)}`}>{row.status}</span>
                 </td>
@@ -939,11 +1071,14 @@ function ResultsTable({ rows }) {
                 <td>{row.piAmount !== undefined ? `₹ ${money(row.piAmount)}` : "—"}</td>
                 <td>{row.amountDifference !== undefined ? `₹ ${money(row.amountDifference)}` : "—"}</td>
                 <td>{row.candidate || row.remarks || "—"}</td>
+                <td className="row-action-cell">
+                  <span className="details-link">Details →</span>
+                </td>
               </tr>
             ))
           ) : (
             <tr>
-              <td colSpan="8" className="empty-state">
+              <td colSpan="9" className="empty-state">
                 Upload files and run reconciliation to preview the report.
               </td>
             </tr>
@@ -951,6 +1086,183 @@ function ResultsTable({ rows }) {
         </tbody>
       </table>
       {rows.length > preview.length && <div className="table-note">Showing first {preview.length} of {integer(rows.length)} rows. Export includes all rows.</div>}
+    </div>
+  );
+}
+
+function DetailModal({ row, onClose }) {
+  if (!row) return null;
+
+  let title = "";
+  let message = "";
+  let tone = "info";
+
+  if (row.status === "Matched") {
+    title = "Reconciliation Successful";
+    message = `This record was successfully matched. The aggregator payment matches the API invoice total of ₹${money(row.piAmount)} using the rule: "${row.matchRule}".`;
+    tone = "good";
+  } else if (row.status === "Amount mismatch") {
+    title = "Amount Mismatch Detected";
+    const delta = row.amountDifference;
+    message = `The payment and API invoice references matched successfully using the rule: "${row.matchRule}", but the amounts do not match. Aggregator amount is ₹${money(row.aggregatorAmount)} and API amount is ₹${money(row.piAmount)}. The difference is ₹${money(delta)}.`;
+    tone = "warn";
+  } else if (row.status === "Aggregator only") {
+    title = "Payment Found in Aggregator Only";
+    message = `This payment was found in the gateway reports (${row.aggregatorSource}) but does not exist in the API invoice sheets. This suggests the invoice record might be missing, unexported, or classified under a different category.`;
+    tone = "info";
+  } else if (row.status === "API only") {
+    title = "Invoice Found in API Only";
+    message = `This invoice was found in the API exports but does not exist in any aggregator reports. This suggests that the customer has either not paid yet, or the payment is still pending gateway settlement.`;
+    tone = "violet";
+  }
+
+  const displayVal = (val) => val !== undefined && val !== "" ? val : "—";
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <header className="modal-header">
+          <div>
+            <span className={`status-badge ${statusClass(row.status)}`}>{row.status}</span>
+            <h2>{title}</h2>
+          </div>
+          <button className="close-button" onClick={onClose} aria-label="Close details modal">×</button>
+        </header>
+
+        <section className={`modal-message-banner ${tone}`}>
+          <p>{message}</p>
+        </section>
+
+        <div className="modal-comparison-grid">
+          <div className="comparison-card">
+            <h3>Aggregator Transaction Details</h3>
+            {row.status === "API only" ? (
+              <div className="empty-side-state">
+                <span>Not found in aggregator data</span>
+                <p>No gateway records matched this API invoice.</p>
+              </div>
+            ) : (
+              <div className="card-fields">
+                <div className="field-row">
+                  <span className="field-label">Source Gate:</span>
+                  <span className="field-value"><strong>{displayVal(row.aggregatorSource)}</strong></span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Source File:</span>
+                  <span className="field-value">{displayVal(row.aggregatorFile)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Sheet &amp; Row:</span>
+                  <span className="field-value">{displayVal(row.aggregatorSheet)} · Row {displayVal(row.aggregatorRow)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Primary Key (Ref):</span>
+                  <span className="field-value highlight">{displayVal(row.aggregatorKey)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Secondary Key (Alt):</span>
+                  <span className="field-value">{displayVal(row.aggregatorAltKey)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Transaction Date:</span>
+                  <span className="field-value">{displayVal(row.aggregatorDate)}</span>
+                </div>
+                <div className="field-row amount-row">
+                  <span className="field-label">Gross Amount:</span>
+                  <span className="field-value">₹ {money(row.aggregatorAmount)}</span>
+                </div>
+                {row.charges !== "" && (
+                  <div className="field-row">
+                    <span className="field-label">Charges &amp; GST:</span>
+                    <span className="field-value">₹ {money(row.charges)} + ₹ {money(row.gst)}</span>
+                  </div>
+                )}
+                {row.netAmount !== "" && (
+                  <div className="field-row">
+                    <span className="field-label">Net Amount:</span>
+                    <span className="field-value">₹ {money(row.netAmount)}</span>
+                  </div>
+                )}
+                <div className="field-row">
+                  <span className="field-label">Gateway Status:</span>
+                  <span className="field-value">{displayVal(row.gatewayStatus)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Settlement Date:</span>
+                  <span className="field-value">{displayVal(row.settlementDate)}</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="comparison-card">
+            <h3>API Invoice Details</h3>
+            {row.status === "Aggregator only" ? (
+              <div className="empty-side-state">
+                <span>Not found in API data</span>
+                <p>No invoice record was found matching this transaction reference.</p>
+              </div>
+            ) : (
+              <div className="card-fields">
+                <div className="field-row">
+                  <span className="field-label">API Category:</span>
+                  <span className="field-value"><strong>{displayVal(row.category)}</strong></span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Source File:</span>
+                  <span className="field-value">{displayVal(row.piFile)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Sheet &amp; Row:</span>
+                  <span className="field-value">{displayVal(row.piSheet)} · Row {displayVal(row.piRow)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Candidate Name:</span>
+                  <span className="field-value">{displayVal(row.candidate)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Reference No:</span>
+                  <span className="field-value highlight">{displayVal(row.piReferenceNo)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Transaction No:</span>
+                  <span className="field-value">{displayVal(row.piTransactionNo)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Invoice No:</span>
+                  <span className="field-value">{displayVal(row.invoiceNo)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Transaction Date:</span>
+                  <span className="field-value">{displayVal(row.piDate)}</span>
+                </div>
+                <div className="field-row amount-row">
+                  <span className="field-label">API Total Amount:</span>
+                  <span className="field-value">₹ {money(row.piAmount)}</span>
+                </div>
+                <div className="field-row">
+                  <span className="field-label">Cost Centre:</span>
+                  <span className="field-value">{displayVal(row.costCentre)}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {row.status !== "API only" && row.status !== "Aggregator only" && (
+          <div className="modal-matching-trace">
+            <h3>Match Execution Details</h3>
+            <div className="trace-details">
+              <p>
+                <strong>Match Rule Used:</strong> {row.matchRule || "—"}
+              </p>
+              <p>
+                <strong>Remarks:</strong> {row.remarks || "No discrepancies found."}
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
